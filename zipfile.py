@@ -227,12 +227,14 @@ class ZipInfo (object):
             raise ValueError("Non-zero size has no source.", self)
         if self.compress_type != ZIP_STORED and self.CRC is None:
             raise ValueError("Need CRC when given pre-processed data.", self)
-
         if self.header_offset is None:
             raise RuntimeError("Missing header offset.", self)
 
     def finalize(self):
-        self.use_zip64 = self.use_zip64 or self.needs_zip64
+        if self.needs_zip64:
+            self.use_zip64 = True
+        if self.CRC is None:
+            self.use_footer = True
 
     def dumps_header(self):
 
@@ -245,16 +247,13 @@ class ZipInfo (object):
             # We write these again after the file.
             CRC = compress_size = file_size = 0
         else:
-            CRC = self.CRC or 0
+            CRC = self.CRC or 0 # Only allowed during size calc.
             compress_size = self.compress_size
             file_size = self.file_size
 
         extra = self.extra
 
         if self.use_zip64:
-
-            # File is larger than what fits into a 4 byte integer,
-            # fall back to the ZIP64 extension
             fmt = '<HHQQ'
             extra = extra + struct.pack(fmt,
                     1, struct.calcsize(fmt)-4, file_size, compress_size)
@@ -263,7 +262,7 @@ class ZipInfo (object):
             self.extract_version = max(45, self.extract_version)
             self.create_version = max(45, self.extract_version)
 
-        filename, flag_bits = self._encodeFilenameFlags()
+        filename, flag_bits = self._encode_filename_flags()
         header = struct.pack(structFileHeader, stringFileHeader,
                  self.extract_version, self.reserved, flag_bits,
                  self.compress_type, dostime, dosdate, CRC,
@@ -275,10 +274,11 @@ class ZipInfo (object):
     def dumps_footer(self, prefer_zip64=None):
         if self.use_footer:
             fmt = '<LQQ' if self.use_zip64 else '<LLL'
-            return struct.pack(fmt, self.CRC, self.compress_size, self.file_size)
+            CRC = self.CRC or 0 # Only allowed during size calc.
+            return struct.pack(fmt, CRC, self.compress_size, self.file_size)
         return ''
 
-    def _encodeFilenameFlags(self):
+    def _encode_filename_flags(self):
         if isinstance(self.filename, unicode):
             try:
                 return self.filename.encode('ascii'), self.flag_bits
@@ -367,7 +367,7 @@ class ZipInfo (object):
             extract_version = self.extract_version
             create_version = self.create_version
 
-        filename, flag_bits = self._encodeFilenameFlags()
+        filename, flag_bits = self._encode_filename_flags()
 
         CRC = self.CRC or 0 # We're only allowed to do this during size calc.
 
