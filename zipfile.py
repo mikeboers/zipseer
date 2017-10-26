@@ -1,8 +1,8 @@
 """
 Read and write ZIP files.
 """
-import struct, os, time, sys, shutil
-import binascii, cStringIO, stat
+import struct, os, time, sys
+import binascii, stat
 import io
 import re
 import string
@@ -36,88 +36,25 @@ ZIP_DEFLATED = 8
 # (section V.I in the format document)
 structEndArchive = "<4s4H2LH"
 stringEndArchive = "PK\005\006"
-sizeEndCentDir = struct.calcsize(structEndArchive)
-
-_ECD_SIGNATURE = 0
-_ECD_DISK_NUMBER = 1
-_ECD_DISK_START = 2
-_ECD_ENTRIES_THIS_DISK = 3
-_ECD_ENTRIES_TOTAL = 4
-_ECD_SIZE = 5
-_ECD_OFFSET = 6
-_ECD_COMMENT_SIZE = 7
-# These last two indices are not part of the structure as defined in the
-# spec, but they are used internally by this module as a convenience
-_ECD_COMMENT = 8
-_ECD_LOCATION = 9
 
 # The "central directory" structure, magic number, size, and indices
 # of entries in the structure (section V.F in the format document)
 structCentralDir = "<4s4B4HL2L5H2L"
 stringCentralDir = "PK\001\002"
-sizeCentralDir = struct.calcsize(structCentralDir)
-
-# indexes of entries in the central directory structure
-_CD_SIGNATURE = 0
-_CD_CREATE_VERSION = 1
-_CD_CREATE_SYSTEM = 2
-_CD_EXTRACT_VERSION = 3
-_CD_EXTRACT_SYSTEM = 4
-_CD_FLAG_BITS = 5
-_CD_COMPRESS_TYPE = 6
-_CD_TIME = 7
-_CD_DATE = 8
-_CD_CRC = 9
-_CD_COMPRESSED_SIZE = 10
-_CD_UNCOMPRESSED_SIZE = 11
-_CD_FILENAME_LENGTH = 12
-_CD_EXTRA_FIELD_LENGTH = 13
-_CD_COMMENT_LENGTH = 14
-_CD_DISK_NUMBER_START = 15
-_CD_INTERNAL_FILE_ATTRIBUTES = 16
-_CD_EXTERNAL_FILE_ATTRIBUTES = 17
-_CD_LOCAL_HEADER_OFFSET = 18
 
 # The "local file header" structure, magic number, size, and indices
 # (section V.A in the format document)
 structFileHeader = "<4s2B4HL2L2H"
 stringFileHeader = "PK\003\004"
-sizeFileHeader = struct.calcsize(structFileHeader)
-
-_FH_SIGNATURE = 0
-_FH_EXTRACT_VERSION = 1
-_FH_EXTRACT_SYSTEM = 2
-_FH_GENERAL_PURPOSE_FLAG_BITS = 3
-_FH_COMPRESSION_METHOD = 4
-_FH_LAST_MOD_TIME = 5
-_FH_LAST_MOD_DATE = 6
-_FH_CRC = 7
-_FH_COMPRESSED_SIZE = 8
-_FH_UNCOMPRESSED_SIZE = 9
-_FH_FILENAME_LENGTH = 10
-_FH_EXTRA_FIELD_LENGTH = 11
 
 # The "Zip64 end of central directory locator" structure, magic number, and size
 structEndArchive64Locator = "<4sLQL"
 stringEndArchive64Locator = "PK\x06\x07"
-sizeEndCentDir64Locator = struct.calcsize(structEndArchive64Locator)
 
 # The "Zip64 end of central directory" record, magic number, size, and indices
 # (section V.G in the format document)
 structEndArchive64 = "<4sQ2H2L4Q"
 stringEndArchive64 = "PK\x06\x06"
-sizeEndCentDir64 = struct.calcsize(structEndArchive64)
-
-_CD64_SIGNATURE = 0
-_CD64_DIRECTORY_RECSIZE = 1
-_CD64_CREATE_VERSION = 2
-_CD64_EXTRACT_VERSION = 3
-_CD64_DISK_NUMBER = 4
-_CD64_DISK_NUMBER_START = 5
-_CD64_NUMBER_ENTRIES_THIS_DISK = 6
-_CD64_NUMBER_ENTRIES_TOTAL = 7
-_CD64_DIRECTORY_SIZE = 8
-_CD64_OFFSET_START_CENTDIR = 9
 
 
 def iter_deflate(source):
@@ -291,6 +228,9 @@ class ZipInfo (object):
         if self.compress_type != ZIP_STORED and self.CRC is None:
             raise ValueError("Need CRC when given pre-processed data.", self)
 
+        if self.header_offset is None:
+            raise RuntimeError("Missing header offset.", self)
+
     def finalize(self):
         self.use_zip64 = self.use_zip64 or self.needs_zip64
 
@@ -409,7 +349,7 @@ class ZipInfo (object):
             file_size = self.file_size
             compress_size = self.compress_size
 
-        header_offset = self.header_offset or 0 # TODO: Only allow this during sizing.
+        header_offset = self.header_offset
         if header_offset > ZIP64_LIMIT:
             extra.append(header_offset)
             header_offset = 0xffffffff
@@ -429,7 +369,7 @@ class ZipInfo (object):
 
         filename, flag_bits = self._encodeFilenameFlags()
 
-        CRC = self.CRC or 0 # TODO: Only allow during sizing.
+        CRC = self.CRC or 0 # We're only allowed to do this during size calc.
 
         centdir = struct.pack(structCentralDir,
             stringCentralDir, create_version,
@@ -488,6 +428,7 @@ class ZipFile(object):
     def calculate_size(self):
         self._pos = 0
         for info in self.infos:
+            info.header_offset = self._pos
             info.finalize()
             info.assert_late_sanity()
             self._pos += len(info.dumps_header())
@@ -544,8 +485,9 @@ class ZipFile(object):
                     structEndArchive64Locator,
                     stringEndArchive64Locator, 0, pos2, 1)
             yield zip64locrec
-            centDirCount = min(centDirCount, 0xFFFF)
-            centDirSize = min(centDirSize, 0xFFFFFFFF)
+
+            centDirCount  = min(centDirCount, 0xFFFF)
+            centDirSize   = min(centDirSize, 0xFFFFFFFF)
             centDirOffset = min(centDirOffset, 0xFFFFFFFF)
 
         endrec = struct.pack(structEndArchive, stringEndArchive,
@@ -583,4 +525,4 @@ if __name__ == '__main__':
         fh.close()
 
     print size
-    
+
