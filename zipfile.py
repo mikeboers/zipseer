@@ -149,6 +149,9 @@ class ZipInfo (object):
             'CRC',
             'compress_size',
             'file_size',
+            'use_zip64',
+            'source_path',
+            'source_func',
         )
 
     def __init__(self, filename, date_time=(1980, 1, 1, 0, 0, 0), compress_type=None):
@@ -202,7 +205,7 @@ class ZipInfo (object):
         self.file_size = None     # Size of the uncompressed file
 
     @classmethod
-    def from_path(cls, filename, arcname=None, compress_type=None):
+    def from_path(cls, filename, arcname=None, compress_type=None, compress_size=None):
 
         st = os.stat(filename)
         isdir = stat.S_ISDIR(st.st_mode)
@@ -218,11 +221,14 @@ class ZipInfo (object):
             arcname += '/'
             compress_type = ZIP_STORED
 
+        if compress_type and compress_type != ZIP_STORED and compress_size is None:
+            raise ValueError("Need compress_size with compress_type.")
+
         self = ZipInfo(arcname, date_time, compress_type=compress_type)
 
         self.external_attr = (st[0] & 0xFFFF) << 16 # Unix attributes
         self.file_size = st.st_size
-
+        self.compress_size = self.file_size if self.compress_type == ZIP_STORED else compress_size
         self.flag_bits = 0x00
 
         if isdir:
@@ -253,7 +259,7 @@ class ZipInfo (object):
 
     @property
     def needs_zip64(self):
-        return file_size > ZIP64_LIMIT or compress_size > ZIP64_LIMIT
+        return self.file_size > ZIP64_LIMIT or self.compress_size > ZIP64_LIMIT
 
     @property
     def use_footer(self):
@@ -276,8 +282,8 @@ class ZipInfo (object):
     def assert_late_sanity(self):
         if self.file_size is None:
             raise ValueError("Missing file_size.", self)
-        if self.compressed_size is None:
-            raise ValueError("Missing compressed_size.", self)
+        if self.compress_size is None:
+            raise ValueError("Missing compress_size.", self)
         if self.needs_zip64 and not self.use_zip64:
             raise ValueError("Needs Zip64 but not setup to use it; call finalize()", self)
         if self.file_size and not (self.source_func or self.source_path):
@@ -299,7 +305,7 @@ class ZipInfo (object):
             # We write these again after the file.
             CRC = compress_size = file_size = 0
         else:
-            CRC = self.CRC
+            CRC = self.CRC or 0
             compress_size = self.compress_size
             file_size = self.file_size
 
@@ -386,7 +392,7 @@ class ZipInfo (object):
         for chunk in x:
             yield x
 
-    def iter_directory_entry(self, zinfo):
+    def iter_directory_entry(self):
 
         dt = self.date_time
         dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
@@ -403,7 +409,7 @@ class ZipInfo (object):
             file_size = self.file_size
             compress_size = self.compress_size
 
-        header_offset = self.header_offset
+        header_offset = self.header_offset or 0 # TODO: Only allow this during sizing.
         if header_offset > ZIP64_LIMIT:
             extra.append(header_offset)
             header_offset = 0xffffffff
@@ -423,11 +429,13 @@ class ZipInfo (object):
 
         filename, flag_bits = self._encodeFilenameFlags()
 
+        CRC = self.CRC or 0 # TODO: Only allow during sizing.
+
         centdir = struct.pack(structCentralDir,
             stringCentralDir, create_version,
             self.create_system, extract_version, self.reserved,
             flag_bits, self.compress_type, dostime, dosdate,
-            self.CRC, compress_size, file_size,
+            CRC, compress_size, file_size,
             len(filename), len(extra_data), len(self.comment),
             0, self.internal_attr, self.external_attr,
             header_offset
@@ -446,6 +454,7 @@ class ZipFile(object):
         self.infos = []      # List of ZipInfo instances for archive
         self.info_by_name = {}    # Find file info given name
 
+        self._finalized = False
         self._pos = 0
 
     @property
@@ -492,6 +501,7 @@ class ZipFile(object):
         for info in self.infos:
             info.finalize()
             info.assert_late_sanity()
+            info.header_offset = self._pos
             for x in info.iter():
                 yield x
         for x in self._iter_footer():
@@ -521,7 +531,7 @@ class ZipFile(object):
         if (
             centDirCount > ZIP_FILECOUNT_LIMIT or
             centDirOffset > ZIP64_LIMIT or
-            centDirSize > ZIP64_LIMIT:
+            centDirSize > ZIP64_LIMIT
         ):
             # Write the ZIP64 end-of-archive records
             zip64endrec = struct.pack(
@@ -571,3 +581,6 @@ if __name__ == '__main__':
 
     if fh:
         fh.close()
+
+    print size
+    
