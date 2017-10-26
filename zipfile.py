@@ -120,11 +120,18 @@ _CD64_DIRECTORY_SIZE = 8
 _CD64_OFFSET_START_CENTDIR = 9
 
 
+def iter_deflate(source):
+    """If you need to compress something."""
+    compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+    for x in source:
+        yield compressor.compress(x)
+    yield compressor.flush()
+
+
 class ZipInfo (object):
     """Class with attributes describing each file in the ZIP archive."""
 
     __slots__ = (
-            'orig_filename',
             'filename',
             'date_time',
             'compress_type',
@@ -142,12 +149,9 @@ class ZipInfo (object):
             'CRC',
             'compress_size',
             'file_size',
-            '_raw_time',
         )
 
-    def __init__(self, filename="NoName", date_time=(1980,1,1,0,0,0)):
-
-        self.orig_filename = filename   # Original file name in archive
+    def __init__(self, filename, date_time=(1980, 1, 1, 0, 0, 0), compress_type=None):
 
         # Terminate the file name at the first null byte.  Null bytes in file
         # names are used as tricks by viruses in archives.
@@ -157,17 +161,20 @@ class ZipInfo (object):
 
         # Ensure paths in generated ZIP files always use forward slashes as
         # required by the ZIP format specification.
-        if os.sep != "/" and os.sep in filename:
-            filename = filename.replace(os.sep, "/")
+        if os.sep != '/' and os.sep in filename:
+            filename = filename.replace(os.sep, '/')
 
         self.filename = filename        # Normalized file name
         self.date_time = date_time      # year, month, day, hour, min, sec
 
         if date_time[0] < 1980:
-            raise ValueError('ZIP does not support timestamps before 1980')
+            raise ValueError("ZIP does not support timestamps before 1980.", date_time)
+
+        if compress_type is None:
+            compress_type = ZIP_STORED
 
         # Standard values:
-        self.compress_type = ZIP_STORED # Type of compression for the file
+        self.compress_type = compress_type# Type of compression for the file
         self.comment = ""               # Comment for each file
         self.extra = ""                 # ZIP extra data
         if sys.platform == 'win32':
@@ -182,19 +189,114 @@ class ZipInfo (object):
         self.volume = 0                 # Volume number of file header
         self.internal_attr = 0          # Internal attributes
         self.external_attr = 0          # External file attributes
-        # Other attributes are set by class ZipFile:
-        # header_offset         Byte offset to the file header
-        # CRC                   CRC-32 of the uncompressed file
-        # compress_size         Size of the compressed file
-        # file_size             Size of the uncompressed file
 
-    def FileHeader(self, _garbage=None):
+        # For deffered creation.
+        self.source_path = None
+        self.source_func = None
+
+        # Mutable state, mostly set by ZipFile
+        self.use_zip64 = False    # Are we using zip64 for sure?
+        self.header_offset = None # Byte offset to the file header
+        self.CRC = None           # CRC-32 of the uncompressed file
+        self.compress_size = None # Size of the compressed file
+        self.file_size = None     # Size of the uncompressed file
+
+    @classmethod
+    def from_path(cls, filename, arcname=None, compress_type=None):
+
+        st = os.stat(filename)
+        isdir = stat.S_ISDIR(st.st_mode)
+        mtime = time.localtime(st.st_mtime)
+        date_time = mtime[0:6]
+
+        if arcname is None:
+            arcname = filename
+        arcname = os.path.normpath(os.path.splitdrive(arcname)[1])
+        while arcname[0] in (os.sep, os.altsep):
+            arcname = arcname[1:]
+        if isdir:
+            arcname += '/'
+            compress_type = ZIP_STORED
+
+        self = ZipInfo(arcname, date_time, compress_type=compress_type)
+
+        self.external_attr = (st[0] & 0xFFFF) << 16 # Unix attributes
+        self.file_size = st.st_size
+
+        self.flag_bits = 0x00
+
+        if isdir:
+            self.file_size = 0
+            self.compress_size = 0
+            self.CRC = 0
+            self.external_attr |= 0x10  # MS-DOS directory flag
+
+        self.source_path = filename
+
+        return self
+
+    @classmethod
+    def from_func(cls, callback, size, arcname, compress_type=None):
+        self = cls(
+            filename=arcname,
+            date_time=time.localtime(time.time())[:6],
+            compress_type=compress_type,
+        )
+        self.source_func = callback
+        self.file_size = size
+        if self.filename[-1] == '/': # Directory!
+            self.external_attr = 0o40775 << 16   # drwxrwxr-x
+            self.external_attr |= 0x10           # MS-DOS directory flag
+        else:
+            self.external_attr = 0o600 << 16     # ?rw-------
+        return self
+
+    @property
+    def needs_zip64(self):
+        return file_size > ZIP64_LIMIT or compress_size > ZIP64_LIMIT
+
+    @property
+    def use_footer(self):
+        return bool(self.flag_bits & 0x08)
+    @use_footer.setter
+    def use_footer(self, v):
+        if v:
+            self.flag_bits |= 0x08
+        else:
+            self.flag_bits &= ~0x08
+
+    def assert_early_sanity(self):
+        if self.compress_type not in (ZIP_STORED, ZIP_DEFLATED):
+            raise ValueError("Compression method is not supported.", self.compress_type)
+        if self.file_size and not (self.source_func or self.source_path):
+            raise ValueError("Contents has size, but no source.")
+        if self.source_func and self.source_path:
+            raise ValueError("Contents is doubly sourced.")
+
+    def assert_late_sanity(self):
+        if self.file_size is None:
+            raise ValueError("Missing file_size.", self)
+        if self.compressed_size is None:
+            raise ValueError("Missing compressed_size.", self)
+        if self.needs_zip64 and not self.use_zip64:
+            raise ValueError("Needs Zip64 but not setup to use it; call finalize()", self)
+        if self.file_size and not (self.source_func or self.source_path):
+            raise ValueError("Non-zero size has no source.", self)
+        if self.compress_type != ZIP_STORED and self.CRC is None:
+            raise ValueError("Need CRC when given pre-processed data.", self)
+
+    def finalize(self):
+        self.use_zip64 = self.use_zip64 or self.needs_zip64
+
+    def dumps_header(self):
+
         """Return the per-file header as a string."""
         dt = self.date_time
         dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
         dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
-        if self.flag_bits & 0x08:
-            # Set these to zero because we write them after the file data
+
+        if self.use_footer:
+            # We write these again after the file.
             CRC = compress_size = file_size = 0
         else:
             CRC = self.CRC
@@ -203,7 +305,8 @@ class ZipInfo (object):
 
         extra = self.extra
 
-        if file_size > ZIP64_LIMIT or compress_size > ZIP64_LIMIT:
+        if self.use_zip64:
+
             # File is larger than what fits into a 4 byte integer,
             # fall back to the ZIP64 extension
             fmt = '<HHQQ'
@@ -220,7 +323,14 @@ class ZipInfo (object):
                  self.compress_type, dostime, dosdate, CRC,
                  compress_size, file_size,
                  len(filename), len(extra))
+
         return header + filename + extra
+
+    def dumps_footer(self, prefer_zip64=None):
+        if self.use_footer:
+            fmt = '<LQQ' if self.use_zip64 else '<LLL'
+            return struct.pack(fmt, self.CRC, self.compress_size, self.file_size)
+        return ''
 
     def _encodeFilenameFlags(self):
         if isinstance(self.filename, unicode):
@@ -231,293 +341,233 @@ class ZipInfo (object):
         else:
             return self.filename, self.flag_bits
 
+    def iter(self):
+        yield self.dumps_header()
+        for chunk in self.iter_source():
+            yield chunk
+        yield self.dumps_footer()
+
+    def iter_source(self):
+
+        if self.source_path:
+            iter_ = self._iter_source_path()
+        else:
+            iter_ = self._iter_source_func()
+
+        if self.CRC is not None:
+            for chunk in iter_:
+                yield chunk
+            return
+
+        CRC = 0
+        size = 0
+        for chunk in iter_:
+            size += len(chunk)
+            CRC = crc32(chunk, CRC) & 0xffffffff
+            yield chunk
+
+        # TODO: Warn if the size differs.
+
+        self.CRC = CRC
+
+    def _iter_source_path(self):
+        with open(self.source_path, 'rb') as fh:
+            while True:
+                chunk = fh.read(8192)
+                if not chunk:
+                    return
+                yield chunk
+
+    def _iter_source_func(self):
+        x = self.source_func()
+        if isinstance(x, basestring):
+            yield x
+            return
+        for chunk in x:
+            yield x
+
+    def iter_directory_entry(self, zinfo):
+
+        dt = self.date_time
+        dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
+        dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
+        extra = []
+
+        # TODO: Should this be use_zip64??
+        if self.needs_zip64:
+            extra.append(self.file_size)
+            extra.append(self.compress_size)
+            file_size = 0xffffffff
+            compress_size = 0xffffffff
+        else:
+            file_size = self.file_size
+            compress_size = self.compress_size
+
+        header_offset = self.header_offset
+        if header_offset > ZIP64_LIMIT:
+            extra.append(header_offset)
+            header_offset = 0xffffffff
+
+        extra_data = self.extra
+        if extra:
+            # Append a ZIP64 field to the extra's
+            extra_data = struct.pack(
+                    '<HH' + 'Q'*len(extra),
+                    1, 8*len(extra), *extra) + extra_data
+
+            extract_version = max(45, self.extract_version)
+            create_version = max(45, self.create_version)
+        else:
+            extract_version = self.extract_version
+            create_version = self.create_version
+
+        filename, flag_bits = self._encodeFilenameFlags()
+
+        centdir = struct.pack(structCentralDir,
+            stringCentralDir, create_version,
+            self.create_system, extract_version, self.reserved,
+            flag_bits, self.compress_type, dostime, dosdate,
+            self.CRC, compress_size, file_size,
+            len(filename), len(extra_data), len(self.comment),
+            0, self.internal_attr, self.external_attr,
+            header_offset
+        )
+        
+        yield centdir        
+        yield filename        
+        yield extra_data        
+        yield self.comment        
+
 
 class ZipFile(object):
 
     def __init__(self):
-        self._allowZip64 = True
-        self._comment = ''
-        self._filePassed = 0
-        self._start_disk = 0
-        self.compression = ZIP_STORED  # Method of compression
-        self.debug = 0  # Level of printing: 0 through 3
-        self.filelist = []      # List of ZipInfo instances for archive
-        self.filename = None
-        self.fp = None
-        self.mode = 'w' # GARBAGE
-        self.NameToInfo = {}    # Find file info given name
+        self.comment = ''
+        self.infos = []      # List of ZipInfo instances for archive
+        self.info_by_name = {}    # Find file info given name
+
+        self._pos = 0
 
     @property
     def comment(self):
         return self._comment
-
     @comment.setter
     def comment(self, comment):
         if len(comment) > ZIP_MAX_COMMENT:
             raise ValueError("Comment must be less than {} long.".format(ZIP_MAX_COMMENT))
         self._comment = comment
 
+    def add_from_path(self, *args, **kwargs):
+        self.add(ZipInfo.from_path(*args, **kwargs))
 
-    def _writecheck(self, zinfo):
-        """Check for errors before writing a file to the archive."""
-        if zinfo.filename in self.NameToInfo:
-            import warnings
-            warnings.warn('Duplicate name: %r' % zinfo.filename, stacklevel=3)
-        if self.mode not in ("w", "a"):
-            raise RuntimeError, 'write() requires mode "w" or "a"'
-        if not self.fp:
-            raise RuntimeError, \
-                  "Attempt to write ZIP archive that was already closed"
-        if zinfo.compress_type == ZIP_DEFLATED and not zlib:
-            raise RuntimeError, \
-                  "Compression requires the (missing) zlib module"
-        if zinfo.compress_type not in (ZIP_STORED, ZIP_DEFLATED):
-            raise RuntimeError, \
-                  "That compression method is not supported"
+    def add_from_func(self, *args, **kwargs):
+        self.add(ZipInfo.from_func(*args, **kwargs))
 
-    def write(self, filename, arcname=None, compress_type=None):
-        """Put the bytes from filename into the archive under the name
-        arcname."""
-        if not self.fp:
-            raise RuntimeError(
-                  "Attempt to write to ZIP archive that was already closed")
+    def add(self, info):
 
-        st = os.stat(filename)
-        isdir = stat.S_ISDIR(st.st_mode)
-        mtime = time.localtime(st.st_mtime)
-        date_time = mtime[0:6]
-        # Create ZipInfo instance to store file information
-        if arcname is None:
-            arcname = filename
-        arcname = os.path.normpath(os.path.splitdrive(arcname)[1])
-        while arcname[0] in (os.sep, os.altsep):
-            arcname = arcname[1:]
-        if isdir:
-            arcname += '/'
-        zinfo = ZipInfo(arcname, date_time)
-        zinfo.external_attr = (st[0] & 0xFFFF) << 16L      # Unix attributes
-        if isdir:
-            zinfo.compress_type = ZIP_STORED
-        elif compress_type is None:
-            zinfo.compress_type = self.compression
-        else:
-            zinfo.compress_type = compress_type
+        if not isinstance(info, ZipInfo):
+            raise TypeError("Archive contents must be ZipInfo.")
 
-        zinfo.file_size = st.st_size
-        zinfo.flag_bits = 0x00
-        zinfo.header_offset = self.fp.tell()    # Start of header bytes
+        if info.filename in self.info_by_name:
+            raise ValueError("Duplicate name.", info.filename)
 
-        self._writecheck(zinfo)
+        info.assert_early_sanity()
 
-        if isdir:
-            zinfo.file_size = 0
-            zinfo.compress_size = 0
-            zinfo.CRC = 0
-            zinfo.external_attr |= 0x10  # MS-DOS directory flag
-            self.filelist.append(zinfo)
-            self.NameToInfo[zinfo.filename] = zinfo
-            self.fp.write(zinfo.FileHeader(False))
-            return
+        self.infos.append(info)
+        self.info_by_name[info.filename] = info
 
-        with open(filename, "rb") as fp:
-            # Must overwrite CRC and sizes with correct data later
-            zinfo.CRC = CRC = 0
-            zinfo.compress_size = compress_size = 0
-            # Compressed size can be larger than uncompressed size
-            zip64 = self._allowZip64 and \
-                    zinfo.file_size * 1.05 > ZIP64_LIMIT
-            self.fp.write(zinfo.FileHeader(zip64))
-            if zinfo.compress_type == ZIP_DEFLATED:
-                cmpr = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION,
-                     zlib.DEFLATED, -15)
-            else:
-                cmpr = None
-            file_size = 0
-            while 1:
-                buf = fp.read(1024 * 8)
-                if not buf:
-                    break
-                file_size = file_size + len(buf)
-                CRC = crc32(buf, CRC) & 0xffffffff
-                if cmpr:
-                    buf = cmpr.compress(buf)
-                    compress_size = compress_size + len(buf)
-                self.fp.write(buf)
-        if cmpr:
-            buf = cmpr.flush()
-            compress_size = compress_size + len(buf)
-            self.fp.write(buf)
-            zinfo.compress_size = compress_size
-        else:
-            zinfo.compress_size = file_size
-        zinfo.CRC = CRC
-        zinfo.file_size = file_size
-        if not zip64 and self._allowZip64:
-            if file_size > ZIP64_LIMIT:
-                raise RuntimeError('File size has increased during compressing')
-            if compress_size > ZIP64_LIMIT:
-                raise RuntimeError('Compressed size larger than uncompressed size')
-        # Seek backwards and write file header (which will now include
-        # correct CRC and file sizes)
-        position = self.fp.tell() # Preserve current position in file
-        self.fp.seek(zinfo.header_offset, 0)
-        self.fp.write(zinfo.FileHeader(zip64))
-        self.fp.seek(position, 0)
-        self.filelist.append(zinfo)
-        self.NameToInfo[zinfo.filename] = zinfo
+    def calculate_size(self):
+        self._pos = 0
+        for info in self.infos:
+            info.finalize()
+            info.assert_late_sanity()
+            self._pos += len(info.dumps_header())
+            self._pos += info.compress_size
+            self._pos += len(info.dumps_footer())
+        for x in self._iter_footer():
+            self._pos += len(x)
+        return self._pos
 
-    def writestr(self, zinfo_or_arcname, bytes, compress_type=None):
-        """Write a file into the archive.  The contents is the string
-        'bytes'.  'zinfo_or_arcname' is either a ZipInfo instance or
-        the name of the file in the archive."""
-        if not isinstance(zinfo_or_arcname, ZipInfo):
-            zinfo = ZipInfo(filename=zinfo_or_arcname,
-                            date_time=time.localtime(time.time())[:6])
+    def _iter(self):
+        for info in self.infos:
+            info.finalize()
+            info.assert_late_sanity()
+            for x in info.iter():
+                yield x
+        for x in self._iter_footer():
+            yield x
 
-            zinfo.compress_type = self.compression
-            if zinfo.filename[-1] == '/':
-                zinfo.external_attr = 0o40775 << 16   # drwxrwxr-x
-                zinfo.external_attr |= 0x10           # MS-DOS directory flag
-            else:
-                zinfo.external_attr = 0o600 << 16     # ?rw-------
-        else:
-            zinfo = zinfo_or_arcname
+    def iter(self):
+        self._pos = 0
+        for chunk in self._iter():
+            self._pos += len(chunk)
+            yield chunk
 
-        if not self.fp:
-            raise RuntimeError(
-                  "Attempt to write to ZIP archive that was already closed")
+    def _iter_footer(self):
 
-        if compress_type is not None:
-            zinfo.compress_type = compress_type
+        pos1 = self._pos
 
-        zinfo.file_size = len(bytes)            # Uncompressed size
-        zinfo.header_offset = self.fp.tell()    # Start of header bytes
-        self._writecheck(zinfo)
-        zinfo.CRC = crc32(bytes) & 0xffffffff       # CRC-32 checksum
-        if zinfo.compress_type == ZIP_DEFLATED:
-            co = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION,
-                 zlib.DEFLATED, -15)
-            bytes = co.compress(bytes) + co.flush()
-            zinfo.compress_size = len(bytes)    # Compressed size
-        else:
-            zinfo.compress_size = zinfo.file_size
-        zip64 = zinfo.file_size > ZIP64_LIMIT or \
-                zinfo.compress_size > ZIP64_LIMIT
-        self.fp.write(zinfo.FileHeader(zip64))
-        self.fp.write(bytes)
-        if zinfo.flag_bits & 0x08:
-            # Write CRC and file sizes after the file data
-            fmt = '<LQQ' if zip64 else '<LLL'
-            self.fp.write(struct.pack(fmt, zinfo.CRC, zinfo.compress_size,
-                  zinfo.file_size))
-        self.fp.flush()
-        self.filelist.append(zinfo)
-        self.NameToInfo[zinfo.filename] = zinfo
+        for info in self.infos:
+            for x in info.iter_directory_entry():
+                yield x
 
-    def close(self):
-        """Close the file, and for mode "w" and "a" write the ending
-        records."""
-        if self.fp is None:
-            return
+        pos2 = self._pos
 
-        try:
-            if self.mode in ("w", "a"): # write ending records
-                pos1 = self.fp.tell()
-                for zinfo in self.filelist:         # write central directory
-                    dt = zinfo.date_time
-                    dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
-                    dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
-                    extra = []
-                    if zinfo.file_size > ZIP64_LIMIT \
-                            or zinfo.compress_size > ZIP64_LIMIT:
-                        extra.append(zinfo.file_size)
-                        extra.append(zinfo.compress_size)
-                        file_size = 0xffffffff
-                        compress_size = 0xffffffff
-                    else:
-                        file_size = zinfo.file_size
-                        compress_size = zinfo.compress_size
+        # Write end-of-zip-archive record
+        centDirCount = len(self.infos)
+        centDirSize = pos2 - pos1
+        centDirOffset = pos1
+        
+        if (
+            centDirCount > ZIP_FILECOUNT_LIMIT or
+            centDirOffset > ZIP64_LIMIT or
+            centDirSize > ZIP64_LIMIT:
+        ):
+            # Write the ZIP64 end-of-archive records
+            zip64endrec = struct.pack(
+                    structEndArchive64, stringEndArchive64,
+                    44, 45, 45, 0, 0, centDirCount, centDirCount,
+                    centDirSize, centDirOffset)
+            yield zip64endrec
 
-                    header_offset = zinfo.header_offset - self._start_disk
-                    if header_offset > ZIP64_LIMIT:
-                        extra.append(header_offset)
-                        header_offset = 0xffffffffL
+            zip64locrec = struct.pack(
+                    structEndArchive64Locator,
+                    stringEndArchive64Locator, 0, pos2, 1)
+            yield zip64locrec
+            centDirCount = min(centDirCount, 0xFFFF)
+            centDirSize = min(centDirSize, 0xFFFFFFFF)
+            centDirOffset = min(centDirOffset, 0xFFFFFFFF)
 
-                    extra_data = zinfo.extra
-                    if extra:
-                        # Append a ZIP64 field to the extra's
-                        extra_data = struct.pack(
-                                '<HH' + 'Q'*len(extra),
-                                1, 8*len(extra), *extra) + extra_data
+        endrec = struct.pack(structEndArchive, stringEndArchive,
+                            0, 0, centDirCount, centDirCount,
+                            centDirSize, centDirOffset, len(self._comment))
 
-                        extract_version = max(45, zinfo.extract_version)
-                        create_version = max(45, zinfo.create_version)
-                    else:
-                        extract_version = zinfo.extract_version
-                        create_version = zinfo.create_version
+        yield endrec
+        yield self._comment
 
-                    try:
-                        filename, flag_bits = zinfo._encodeFilenameFlags()
-                        centdir = struct.pack(structCentralDir,
-                        stringCentralDir, create_version,
-                        zinfo.create_system, extract_version, zinfo.reserved,
-                        flag_bits, zinfo.compress_type, dostime, dosdate,
-                        zinfo.CRC, compress_size, file_size,
-                        len(filename), len(extra_data), len(zinfo.comment),
-                        0, zinfo.internal_attr, zinfo.external_attr,
-                        header_offset)
-                    except DeprecationWarning:
-                        print >>sys.stderr, (structCentralDir,
-                        stringCentralDir, create_version,
-                        zinfo.create_system, extract_version, zinfo.reserved,
-                        zinfo.flag_bits, zinfo.compress_type, dostime, dosdate,
-                        zinfo.CRC, compress_size, file_size,
-                        len(zinfo.filename), len(extra_data), len(zinfo.comment),
-                        0, zinfo.internal_attr, zinfo.external_attr,
-                        header_offset)
-                        raise
-                    self.fp.write(centdir)
-                    self.fp.write(filename)
-                    self.fp.write(extra_data)
-                    self.fp.write(zinfo.comment)
 
-                pos2 = self.fp.tell()
-                # Write end-of-zip-archive record
-                centDirCount = len(self.filelist)
-                centDirSize = pos2 - pos1
-                centDirOffset = pos1 - self._start_disk
-                requires_zip64 = None
-                if centDirCount > ZIP_FILECOUNT_LIMIT:
-                    requires_zip64 = "Files count"
-                elif centDirOffset > ZIP64_LIMIT:
-                    requires_zip64 = "Central directory offset"
-                elif centDirSize > ZIP64_LIMIT:
-                    requires_zip64 = "Central directory size"
-                if requires_zip64:
-                    # Need to write the ZIP64 end-of-archive records
-                    zip64endrec = struct.pack(
-                            structEndArchive64, stringEndArchive64,
-                            44, 45, 45, 0, 0, centDirCount, centDirCount,
-                            centDirSize, centDirOffset)
-                    self.fp.write(zip64endrec)
+if __name__ == '__main__':
 
-                    zip64locrec = struct.pack(
-                            structEndArchive64Locator,
-                            stringEndArchive64Locator, 0, pos2, 1)
-                    self.fp.write(zip64locrec)
-                    centDirCount = min(centDirCount, 0xFFFF)
-                    centDirSize = min(centDirSize, 0xFFFFFFFF)
-                    centDirOffset = min(centDirOffset, 0xFFFFFFFF)
+    import argparse
 
-                endrec = struct.pack(structEndArchive, stringEndArchive,
-                                    0, 0, centDirCount, centDirCount,
-                                    centDirSize, centDirOffset, len(self._comment))
-                self.fp.write(endrec)
-                self.fp.write(self._comment)
-                self.fp.flush()
-        finally:
-            fp = self.fp
-            self.fp = None
-            if not self._filePassed:
-                fp.close()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-o', '--output')
+    parser.add_argument('paths', nargs='+')
+    args = parser.parse_args()
 
+    zipfile = ZipFile()
+    for path in args.paths:
+        zipfile.add_from_path(path)
+
+    print zipfile.calculate_size()
+    size = 0
+
+    fh = open(args.output, 'wb') if args.output else None
+
+    for chunk in zipfile.iter():
+        size += len(chunk)
+        if fh:
+            fh.write(chunk)
+
+    if fh:
+        fh.close()
