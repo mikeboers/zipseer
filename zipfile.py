@@ -275,7 +275,7 @@ class ZipInfo (object):
         if self.use_footer:
             fmt = '<LQQ' if self.use_zip64 else '<LLL'
             CRC = self.CRC or 0 # Only allowed during size calc.
-            return struct.pack(fmt, CRC, self.compress_size, self.file_size)
+            return b'PK\x07\x08' + struct.pack(fmt, CRC, self.compress_size, self.file_size)
         return ''
 
     def _encode_filename_flags(self):
