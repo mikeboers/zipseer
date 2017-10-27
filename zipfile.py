@@ -209,8 +209,6 @@ class ZipInfo (object):
             self.flag_bits &= ~0x08
 
     def assert_early_sanity(self):
-        if self.compress_type not in (ZIP_STORED, ZIP_DEFLATED):
-            raise ValueError("Compression method is not supported.", self.compress_type)
         if self.file_size and not (self.source_func or self.source_path):
             raise ValueError("Contents has size, but no source.")
         if self.source_func and self.source_path:
