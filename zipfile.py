@@ -116,14 +116,14 @@ class ZipInfo (object):
             compress_type = COMPRESSION_NONE
 
         # Standard values:
-        self.compress_type = compress_type# Type of compression for the file
+        self.compress_type = compress_type # Type of compression for the file
         self.comment = ""               # Comment for each file
         self.extra = ""                 # ZIP extra data
         if sys.platform == 'win32':
-            self.create_system = 0          # System which created ZIP archive
+            self.create_system = 0      # System which created ZIP archive
         else:
             # Assume everything else is unix-y
-            self.create_system = 3          # System which created ZIP archive
+            self.create_system = 3      # System which created ZIP archive
         self.create_version = 20        # Version which created ZIP archive
         self.extract_version = 20       # Version needed to extract archive
         self.reserved = 0               # Must be zero
@@ -132,7 +132,7 @@ class ZipInfo (object):
         self.internal_attr = 0          # Internal attributes
         self.external_attr = 0          # External file attributes
 
-        # For deffered creation.
+        # For deferred creation.
         self.source_path = None
         self.source_func = None
 
@@ -254,9 +254,14 @@ class ZipInfo (object):
         extra = self.extra
 
         if self.use_zip64:
+            # Stuff the real sizes into an "extra" header. Even if we're using
+            # a data descriptor, we need to do this and put zeroes in there
+            # because (a) the zeroes are required, and (b) both sizes are required
+            # if the ZIP64 "extra" exists, and (c) if we don't do either then
+            # how will the decompressor know that data descriptor will have
+            # 8 byte values?
             fmt = '<HHQQ'
-            extra = extra + struct.pack(fmt,
-                    1, struct.calcsize(fmt)-4, file_size, compress_size)
+            extra = extra + struct.pack(fmt, 1, struct.calcsize(fmt) - 4, file_size, compress_size)
             file_size = 0xffffffff
             compress_size = 0xffffffff
             self.extract_version = max(45, self.extract_version)
@@ -465,7 +470,8 @@ class ZipFile(object):
         for info in self.infos:
             yield info.dumps_central_directory_header()
 
-        cent_dir_size   = self._pos - cent_dir_offset
+        cent_dir_64_offset = self._pos
+        cent_dir_size = cent_dir_64_offset - cent_dir_offset
         
         if (
             # The spec requires ZIP64 if any of these are >, but we're testing
@@ -485,7 +491,7 @@ class ZipFile(object):
 
             zip64locrec = struct.pack(
                     structEndArchive64Locator,
-                    stringEndArchive64Locator, 0, pos2, 1)
+                    stringEndArchive64Locator, 0, cent_dir_64_offset, 1)
             yield zip64locrec
 
             cent_dir_count  = MAX_16BIT
@@ -507,12 +513,18 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-o', '--output')
+    parser.add_argument('--only-to-zip64', action='store_true')
     parser.add_argument('paths', nargs='+')
     args = parser.parse_args()
 
+    content_size = 0
     zipseer = ZipFile()
     for path in args.paths:
         zipseer.add_from_path(path)
+        if args.only_to_zip64:
+            content_size += os.path.getsize(path)
+            if content_size > MAX_32BIT:
+                break
 
     print zipseer.calculate_size()
 
