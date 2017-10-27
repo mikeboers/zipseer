@@ -167,7 +167,7 @@ class ZipInfo (object):
 
         self.external_attr = (st[0] & 0xFFFF) << 16 # Unix attributes
         self.file_size = st.st_size
-        self.compress_size = self.file_size if self.compress_type == COMPRESSION_NONE else compress_size
+        self.compress_size = compress_size
         self.flag_bits = 0x00
 
         if isdir:
@@ -181,7 +181,7 @@ class ZipInfo (object):
         return self
 
     @classmethod
-    def from_func(cls, callback, size, arcname, compress_type=None):
+    def from_func(cls, callback, size, arcname, compress_type=None, compress_size=None):
         self = cls(
             filename=arcname,
             date_time=time.localtime(time.time())[:6],
@@ -189,6 +189,7 @@ class ZipInfo (object):
         )
         self.source_func = callback
         self.file_size = size
+        self.compress_size = compress_size
         if self.filename[-1] == '/': # Directory!
             self.external_attr = 0o40775 << 16   # drwxrwxr-x
             self.external_attr |= 0x10           # MS-DOS directory flag
@@ -231,8 +232,13 @@ class ZipInfo (object):
             raise RuntimeError("Missing header offset.", self)
 
     def finalize(self):
+        if self.compress_size is None:
+            if self.compress_type != COMPRESSION_NONE:
+                raise ValueError("Compress size required if content is compressed.")
+            self.compress_size = self.file_size
         if self.needs_zip64:
             self.use_zip64 = True
+        # self.CRC = 1 # Add bad CRC to not use a data descriptor.
         if self.CRC is None:
             self.use_data_descriptor = True
 
@@ -322,6 +328,7 @@ class ZipInfo (object):
         # TODO: Warn if the size differs.
 
         self.CRC = CRC
+        #self.CRC = 1 # Add a bad CRC.
 
     def _iter_source_path(self):
         with open(self.source_path, 'rb') as fh:
@@ -337,7 +344,7 @@ class ZipInfo (object):
             yield x
             return
         for chunk in x:
-            yield x
+            yield chunk
 
     def dumps_central_directory_header(self):
 
@@ -433,8 +440,11 @@ class ZipFile(object):
         self.infos.append(info)
         self.info_by_name[info.filename] = info
 
-    def calculate_size(self):
+    def calculate_size(self, unify_zip64=False, only_members=False):
+
+        all_use_64 = True
         self._pos = 0
+
         for info in self.infos:
             info.header_offset = self._pos
             info.finalize()
@@ -442,11 +452,27 @@ class ZipFile(object):
             self._pos += len(info.dumps_local_file_header())
             self._pos += info.compress_size
             self._pos += len(info.dumps_data_descriptor())
+            all_use_64 = all_use_64 and info.use_zip64
+
+        if unify_zip64 and not all_use_64 and (self._pos > MAX_32BIT or len(self.infos) > MAX_16BIT):
+            # N.B.: We're not checking the central directory size here.
+            # TODO: Do so.
+            for info in self.infos:
+                info.use_zip64 = True
+            self.calculate_size(only_members=True) # Reset the _pos up to here.
+
+        if only_members: # Effectively a recursion check for unify_zip64.
+            return
+
         for x in self.iter_central_directory():
             self._pos += len(x)
+
         return self._pos
 
     def _iter(self):
+
+        self._pos = 0
+
         for info in self.infos:
             info.finalize()
             info.assert_late_sanity()
@@ -457,7 +483,6 @@ class ZipFile(object):
             yield x
 
     def iter(self):
-        self._pos = 0
         for chunk in self._iter():
             self._pos += len(chunk)
             yield chunk
@@ -514,17 +539,27 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-o', '--output')
     parser.add_argument('--only-to-zip64', action='store_true')
-    parser.add_argument('paths', nargs='+')
+    parser.add_argument('--add-large-file', action='store_true')
+    parser.add_argument('paths', nargs='*')
     args = parser.parse_args()
 
     content_size = 0
+
     zipseer = ZipFile()
     for path in args.paths:
         zipseer.add_from_path(path)
+
         if args.only_to_zip64:
             content_size += os.path.getsize(path)
             if content_size > MAX_32BIT:
                 break
+
+    if args.add_large_file:
+        def iter_large_file():
+            for i in xrange(4 * 1024 * 1024):
+                yield '%1023d\n' % i
+        mem = zipseer.add_from_func(iter_large_file, 4 * 1024 * 1024 * 1024, 'counter.txt')
+        print mem.compress_size
 
     print zipseer.calculate_size()
 
