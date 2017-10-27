@@ -14,17 +14,15 @@ except ImportError:
     zlib = None
     crc32 = binascii.crc32
 
-__all__ = ["ZIP_STORED", "ZIP_DEFLATED",
+__all__ = ["COMPRESSION_NONE", "COMPRESSION_DEFLATE",
            "ZipInfo", "ZipFile"]
 
-ZIP64_LIMIT = (1 << 31) - 1
-ZIP_FILECOUNT_LIMIT = (1 << 16) - 1
-ZIP_MAX_COMMENT = (1 << 16) - 1
+MAX_32BIT = (1 << 32) - 1
+MAX_16BIT = (1 << 16) - 1
 
-# constants for Zip file compression methods
-ZIP_STORED = 0
-ZIP_DEFLATED = 8
-# Other ZIP compression methods not supported
+# The compression methods we understand.
+COMPRESSION_NONE = 0
+COMPRESSION_DEFLATE = 8
 
 # Below are some formats and associated data for reading/writing headers using
 # the struct module.  The names and structures of headers/records are those used
@@ -34,27 +32,31 @@ ZIP_DEFLATED = 8
 
 # The "end of central directory" structure, magic number, size, and indices
 # (section V.I in the format document)
-structEndArchive = "<4s4H2LH"
-stringEndArchive = "PK\005\006"
+structEndArchive = '<4s4H2LH'
+stringEndArchive = 'PK\005\006'
 
 # The "central directory" structure, magic number, size, and indices
 # of entries in the structure (section V.F in the format document)
-structCentralDir = "<4s4B4HL2L5H2L"
-stringCentralDir = "PK\001\002"
+structCentralDir = '<4s4B4HL2L5H2L'
+stringCentralDir = 'PK\001\002'
 
-# The "local file header" structure, magic number, size, and indices
+# The "dumps_local_file_header" structure, magic number, size, and indices
 # (section V.A in the format document)
-structFileHeader = "<4s2B4HL2L2H"
-stringFileHeader = "PK\003\004"
+structFileHeader = '<4s2B4HL2L2H'
+stringFileHeader = 'PK\003\004'
+
+structDataDescriptor = '<4sLLL'
+structDataDescriptor64 = '<4sLQQ'
+stringDataDescriptor = 'PK\x07\x08'
 
 # The "Zip64 end of central directory locator" structure, magic number, and size
-structEndArchive64Locator = "<4sLQL"
-stringEndArchive64Locator = "PK\x06\x07"
+structEndArchive64Locator = '<4sLQL'
+stringEndArchive64Locator = 'PK\x06\x07'
 
 # The "Zip64 end of central directory" record, magic number, size, and indices
 # (section V.G in the format document)
-structEndArchive64 = "<4sQ2H2L4Q"
-stringEndArchive64 = "PK\x06\x06"
+structEndArchive64 = '<4sQ2H2L4Q'
+stringEndArchive64 = 'PK\x06\x06'
 
 
 def iter_deflate(source):
@@ -111,7 +113,7 @@ class ZipInfo (object):
             raise ValueError("ZIP does not support timestamps before 1980.", date_time)
 
         if compress_type is None:
-            compress_type = ZIP_STORED
+            compress_type = COMPRESSION_NONE
 
         # Standard values:
         self.compress_type = compress_type# Type of compression for the file
@@ -156,16 +158,16 @@ class ZipInfo (object):
             arcname = arcname[1:]
         if isdir:
             arcname += '/'
-            compress_type = ZIP_STORED
+            compress_type = COMPRESSION_NONE
 
-        if compress_type and compress_type != ZIP_STORED and compress_size is None:
+        if compress_type and compress_type != COMPRESSION_NONE and compress_size is None:
             raise ValueError("Need compress_size with compress_type.")
 
         self = ZipInfo(arcname, date_time, compress_type=compress_type)
 
         self.external_attr = (st[0] & 0xFFFF) << 16 # Unix attributes
         self.file_size = st.st_size
-        self.compress_size = self.file_size if self.compress_type == ZIP_STORED else compress_size
+        self.compress_size = self.file_size if self.compress_type == COMPRESSION_NONE else compress_size
         self.flag_bits = 0x00
 
         if isdir:
@@ -196,13 +198,13 @@ class ZipInfo (object):
 
     @property
     def needs_zip64(self):
-        return self.file_size > ZIP64_LIMIT or self.compress_size > ZIP64_LIMIT
+        return self.file_size > MAX_32BIT or self.compress_size > MAX_32BIT
 
     @property
-    def use_footer(self):
+    def use_data_descriptor(self):
         return bool(self.flag_bits & 0x08)
-    @use_footer.setter
-    def use_footer(self, v):
+    @use_data_descriptor.setter
+    def use_data_descriptor(self, v):
         if v:
             self.flag_bits |= 0x08
         else:
@@ -223,8 +225,8 @@ class ZipInfo (object):
             raise ValueError("Needs Zip64 but not setup to use it; call finalize()", self)
         if self.file_size and not (self.source_func or self.source_path):
             raise ValueError("Non-zero size has no source.", self)
-        if self.compress_type != ZIP_STORED and self.CRC is None:
-            raise ValueError("Need CRC when given pre-processed data.", self)
+        if self.compress_type != COMPRESSION_NONE and self.CRC is None:
+            raise ValueError("Need CRC when given pre-compressed data.", self)
         if self.header_offset is None:
             raise RuntimeError("Missing header offset.", self)
 
@@ -232,16 +234,16 @@ class ZipInfo (object):
         if self.needs_zip64:
             self.use_zip64 = True
         if self.CRC is None:
-            self.use_footer = True
+            self.use_data_descriptor = True
 
-    def dumps_header(self):
+    def dumps_local_file_header(self):
 
         """Return the per-file header as a string."""
         dt = self.date_time
         dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
         dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
 
-        if self.use_footer:
+        if self.use_data_descriptor:
             # We write these again after the file.
             CRC = compress_size = file_size = 0
         else:
@@ -269,11 +271,13 @@ class ZipInfo (object):
 
         return header + filename + extra
 
-    def dumps_footer(self, prefer_zip64=None):
-        if self.use_footer:
-            fmt = '<LQQ' if self.use_zip64 else '<LLL'
+    def dumps_data_descriptor(self):
+        if self.use_data_descriptor:
+            fmt = structDataDescriptor64 if self.use_zip64 else structDataDescriptor
             CRC = self.CRC or 0 # Only allowed during size calc.
-            return b'PK\x07\x08' + struct.pack(fmt, CRC, self.compress_size, self.file_size)
+            return struct.pack(fmt,
+                stringDataDescriptor, CRC, self.compress_size, self.file_size
+            )
         return ''
 
     def _encode_filename_flags(self):
@@ -285,13 +289,13 @@ class ZipInfo (object):
         else:
             return self.filename, self.flag_bits
 
-    def iter(self):
-        yield self.dumps_header()
-        for chunk in self.iter_source():
+    def iter_main(self):
+        yield self.dumps_local_file_header()
+        for chunk in self._iter_source():
             yield chunk
-        yield self.dumps_footer()
+        yield self.dumps_data_descriptor()
 
-    def iter_source(self):
+    def _iter_source(self):
 
         if self.source_path:
             iter_ = self._iter_source_path()
@@ -330,7 +334,7 @@ class ZipInfo (object):
         for chunk in x:
             yield x
 
-    def iter_directory_entry(self):
+    def dumps_central_directory_header(self):
 
         dt = self.date_time
         dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
@@ -348,7 +352,7 @@ class ZipInfo (object):
             compress_size = self.compress_size
 
         header_offset = self.header_offset
-        if header_offset > ZIP64_LIMIT:
+        if header_offset > MAX_32BIT:
             extra.append(header_offset)
             header_offset = 0xffffffff
 
@@ -379,10 +383,7 @@ class ZipInfo (object):
             header_offset
         )
         
-        yield centdir        
-        yield filename        
-        yield extra_data        
-        yield self.comment        
+        return centdir + filename + extra_data + self.comment
 
 
 class ZipFile(object):
@@ -400,15 +401,19 @@ class ZipFile(object):
         return self._comment
     @comment.setter
     def comment(self, comment):
-        if len(comment) > ZIP_MAX_COMMENT:
-            raise ValueError("Comment must be less than {} long.".format(ZIP_MAX_COMMENT))
+        if len(comment) > MAX_16BIT:
+            raise ValueError("Comment must be less than {} long.".format(MAX_16BIT))
         self._comment = comment
 
     def add_from_path(self, *args, **kwargs):
-        self.add(ZipInfo.from_path(*args, **kwargs))
+        info = ZipInfo.from_path(*args, **kwargs)
+        self.add(info)
+        return info
 
     def add_from_func(self, *args, **kwargs):
-        self.add(ZipInfo.from_func(*args, **kwargs))
+        info = ZipInfo.from_func(*args, **kwargs)
+        self.add(info)
+        return info
 
     def add(self, info):
 
@@ -429,10 +434,10 @@ class ZipFile(object):
             info.header_offset = self._pos
             info.finalize()
             info.assert_late_sanity()
-            self._pos += len(info.dumps_header())
+            self._pos += len(info.dumps_local_file_header())
             self._pos += info.compress_size
-            self._pos += len(info.dumps_footer())
-        for x in self._iter_footer():
+            self._pos += len(info.dumps_data_descriptor())
+        for x in self.iter_central_directory():
             self._pos += len(x)
         return self._pos
 
@@ -441,9 +446,9 @@ class ZipFile(object):
             info.finalize()
             info.assert_late_sanity()
             info.header_offset = self._pos
-            for x in info.iter():
+            for x in info.iter_main():
                 yield x
-        for x in self._iter_footer():
+        for x in self.iter_central_directory():
             yield x
 
     def iter(self):
@@ -452,35 +457,30 @@ class ZipFile(object):
             self._pos += len(chunk)
             yield chunk
 
-    def _iter_footer(self):
+    def iter_central_directory(self):
 
-        pos1 = self._pos
+        cent_dir_count = len(self.infos)
+        cent_dir_offset = self._pos
 
         for info in self.infos:
-            for x in info.iter_directory_entry():
-                yield x
+            yield info.dumps_central_directory_header()
 
-        pos2 = self._pos
-
-        # Write end-of-zip-archive record
-        centDirCount = len(self.infos)
-        centDirSize = pos2 - pos1
-        centDirOffset = pos1
+        cent_dir_size   = self._pos - cent_dir_offset
         
         if (
             # The spec requires ZIP64 if any of these are >, but we're testing
             # against >= to avoid an edge case in which one of them is > and
             # one is ==. So instead of being wrong in that case, we're ZIP64
             # if everything is ==.
-            centDirCount >= ZIP_FILECOUNT_LIMIT or
-            centDirOffset >= ZIP64_LIMIT or
-            centDirSize >= ZIP64_LIMIT
+            cent_dir_count  >= MAX_16BIT or
+            cent_dir_offset >= MAX_32BIT or
+            cent_dir_size   >= MAX_32BIT
         ):
             # Write the ZIP64 end-of-archive records
             zip64endrec = struct.pack(
                     structEndArchive64, stringEndArchive64,
-                    44, 45, 45, 0, 0, centDirCount, centDirCount,
-                    centDirSize, centDirOffset)
+                    44, 45, 45, 0, 0, cent_dir_count, cent_dir_count,
+                    cent_dir_size, cent_dir_offset)
             yield zip64endrec
 
             zip64locrec = struct.pack(
@@ -488,16 +488,17 @@ class ZipFile(object):
                     stringEndArchive64Locator, 0, pos2, 1)
             yield zip64locrec
 
-            centDirCount  = 0xFFFF
-            centDirSize   = 0xFFFFFFFF
-            centDirOffset = 0xFFFFFFFF
+            cent_dir_count  = MAX_16BIT
+            cent_dir_size   = MAX_32BIT
+            cent_dir_offset = MAX_32BIT
 
         endrec = struct.pack(structEndArchive, stringEndArchive,
-                            0, 0, centDirCount, centDirCount,
-                            centDirSize, centDirOffset, len(self._comment))
+                            0, 0, cent_dir_count, cent_dir_count,
+                            cent_dir_size, cent_dir_offset, len(self._comment))
 
         yield endrec
-        yield self._comment
+        if self._comment:
+            yield self._comment
 
 
 if __name__ == '__main__':
@@ -509,22 +510,21 @@ if __name__ == '__main__':
     parser.add_argument('paths', nargs='+')
     args = parser.parse_args()
 
-    zipfile = ZipFile()
+    zipseer = ZipFile()
     for path in args.paths:
-        zipfile.add_from_path(path)
+        zipseer.add_from_path(path)
 
-    print zipfile.calculate_size()
-    size = 0
+    print zipseer.calculate_size()
 
     fh = open(args.output, 'wb') if args.output else None
 
-    for chunk in zipfile.iter():
+    size = 0
+    for chunk in zipseer.iter():
         size += len(chunk)
         if fh:
             fh.write(chunk)
+    print size
 
     if fh:
         fh.close()
-
-    print size
 
