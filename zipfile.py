@@ -85,7 +85,7 @@ class ZipInfo (object):
             'internal_attr',
             'external_attr',
             'header_offset',
-            'CRC',
+            'crc',
             'compress_size',
             'file_size',
             'use_zip64',
@@ -93,7 +93,8 @@ class ZipInfo (object):
             'source_func',
         )
 
-    def __init__(self, filename, date_time=(1980, 1, 1, 0, 0, 0), compress_type=None):
+    def __init__(self, filename, date_time=(1980, 1, 1, 0, 0, 0),
+        file_size=None, compress_type=None, compress_size=None, crc=None):
 
         # Terminate the file name at the first null byte.  Null bytes in file
         # names are used as tricks by viruses in archives.
@@ -137,14 +138,14 @@ class ZipInfo (object):
         self.source_func = None
 
         # Mutable state, mostly set by ZipFile
-        self.use_zip64 = False    # Are we using zip64 for sure?
-        self.header_offset = None # Byte offset to the file header
-        self.CRC = None           # CRC-32 of the uncompressed file
-        self.compress_size = None # Size of the compressed file
-        self.file_size = None     # Size of the uncompressed file
+        self.use_zip64 = False             # Are we using zip64 for sure?
+        self.header_offset = None          # Byte offset to the file header
+        self.crc = crc                     # CRC-32 of the uncompressed file
+        self.compress_size = compress_size # Size of the compressed file
+        self.file_size = file_size         # Size of the uncompressed file
 
     @classmethod
-    def from_path(cls, filename, arcname=None, compress_type=None, compress_size=None):
+    def from_path(cls, filename, arcname=None, **kwargs):
 
         st = os.stat(filename)
         isdir = stat.S_ISDIR(st.st_mode)
@@ -158,38 +159,32 @@ class ZipInfo (object):
             arcname = arcname[1:]
         if isdir:
             arcname += '/'
-            compress_type = COMPRESSION_NONE
 
-        if compress_type and compress_type != COMPRESSION_NONE and compress_size is None:
-            raise ValueError("Need compress_size with compress_type.")
-
-        self = ZipInfo(arcname, date_time, compress_type=compress_type)
+        self = ZipInfo(arcname, date_time, **kwargs)
 
         self.external_attr = (st[0] & 0xFFFF) << 16 # Unix attributes
-        self.file_size = st.st_size
-        self.compress_size = compress_size
-        self.flag_bits = 0x00
+        self.compress_size = st.st_size
+        self.source_path = filename
 
         if isdir:
-            self.file_size = 0
+            self.compress_type = COMPRESSION_NONE
             self.compress_size = 0
-            self.CRC = 0
+            self.file_size = 0
+            self.crc = 0
             self.external_attr |= 0x10  # MS-DOS directory flag
-
-        self.source_path = filename
+            self.source_path = None
 
         return self
 
     @classmethod
-    def from_func(cls, callback, size, arcname, compress_type=None, compress_size=None):
+    def from_func(cls, callback, compress_size, arcname, **kwargs):
         self = cls(
             filename=arcname,
             date_time=time.localtime(time.time())[:6],
-            compress_type=compress_type,
+            compress_size=compress_size,
+            **kwargs
         )
         self.source_func = callback
-        self.file_size = size
-        self.compress_size = compress_size
         if self.filename[-1] == '/': # Directory!
             self.external_attr = 0o40775 << 16   # drwxrwxr-x
             self.external_attr |= 0x10           # MS-DOS directory flag
@@ -226,20 +221,19 @@ class ZipInfo (object):
             raise ValueError("Needs Zip64 but not setup to use it; call finalize()", self)
         if self.file_size and not (self.source_func or self.source_path):
             raise ValueError("Non-zero size has no source.", self)
-        if self.compress_type != COMPRESSION_NONE and self.CRC is None:
+        if self.compress_type != COMPRESSION_NONE and self.crc is None:
             raise ValueError("Need CRC when given pre-compressed data.", self)
         if self.header_offset is None:
             raise RuntimeError("Missing header offset.", self)
 
     def finalize(self):
-        if self.compress_size is None:
+        if self.file_size is None:
             if self.compress_type != COMPRESSION_NONE:
-                raise ValueError("Compress size required if content is compressed.")
-            self.compress_size = self.file_size
+                raise ValueError("file_size required if content is compressed.")
+            self.file_size = self.compress_size
         if self.needs_zip64:
             self.use_zip64 = True
-        # self.CRC = 1 # Add bad CRC to not use a data descriptor.
-        if self.CRC is None:
+        if self.crc is None:
             self.use_data_descriptor = True
 
     def dumps_local_file_header(self):
@@ -253,7 +247,7 @@ class ZipInfo (object):
             # We write these again after the file.
             CRC = compress_size = file_size = 0
         else:
-            CRC = self.CRC or 0 # Only allowed during size calc.
+            CRC = self.crc or 0 # Only allowed during size calc.
             compress_size = self.compress_size
             file_size = self.file_size
 
@@ -285,7 +279,7 @@ class ZipInfo (object):
     def dumps_data_descriptor(self):
         if self.use_data_descriptor:
             fmt = structDataDescriptor64 if self.use_zip64 else structDataDescriptor
-            CRC = self.CRC or 0 # Only allowed during size calc.
+            CRC = self.crc or 0 # Only allowed during size calc.
             return struct.pack(fmt,
                 stringDataDescriptor, CRC, self.compress_size, self.file_size
             )
@@ -313,7 +307,7 @@ class ZipInfo (object):
         else:
             iter_ = self._iter_source_func()
 
-        if self.CRC is not None:
+        if self.crc is not None:
             for chunk in iter_:
                 yield chunk
             return
@@ -325,10 +319,9 @@ class ZipInfo (object):
             CRC = crc32(chunk, CRC) & 0xffffffff
             yield chunk
 
-        # TODO: Warn if the size differs.
+        # TODO: Warn if the size (or CRC) differs.
 
-        self.CRC = CRC
-        #self.CRC = 1 # Add a bad CRC.
+        self.crc = CRC
 
     def _iter_source_path(self):
         with open(self.source_path, 'rb') as fh:
@@ -383,7 +376,7 @@ class ZipInfo (object):
 
         filename, flag_bits = self._encode_filename_flags()
 
-        CRC = self.CRC or 0 # We're only allowed to do this during size calc.
+        CRC = self.crc or 0 # We're only allowed to do this during size calc.
 
         centdir = struct.pack(structCentralDir,
             stringCentralDir, create_version,
@@ -538,35 +531,80 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-o', '--output')
-    parser.add_argument('--only-to-zip64', action='store_true')
+
+    parser.add_argument('--force-data-descriptor', action='store_true')
+
+    parser.add_argument('--unify-zip64', action='store_true')
+    parser.add_argument('--until-zip64', action='store_true')
+
+    parser.add_argument('--corrupt-macs', action='store_true')
+
     parser.add_argument('--add-large-file', action='store_true')
+    parser.add_argument('--add-large-null', action='store_true')
+
     parser.add_argument('paths', nargs='*')
     args = parser.parse_args()
 
     content_size = 0
 
-    zipseer = ZipFile()
+    zipper = ZipFile()
     for path in args.paths:
-        zipseer.add_from_path(path)
+        zipper.add_from_path(path)
 
-        if args.only_to_zip64:
+        if args.until_zip64:
             content_size += os.path.getsize(path)
             if content_size > MAX_32BIT:
                 break
 
     if args.add_large_file:
         def iter_large_file():
-            for i in xrange(4 * 1024 * 1024):
-                yield '%1023d\n' % i
-        mem = zipseer.add_from_func(iter_large_file, 4 * 1024 * 1024 * 1024, 'counter.txt')
-        print mem.compress_size
+            for i in xrange(2**30):
+                yield '%0x' % i
+        mem = zipper.add_from_func(iter_large_file, 2**32, 'counter.txt')
+        print mem.file_size
 
-    print zipseer.calculate_size()
+    if args.add_large_null:
+
+        null_mb = '\0' * 1024 * 1024
+
+        path = 'null.gz'
+        if not os.path.exists(path):
+            print 'Compressing 4GB of nulls...'
+            def iter_simple():
+                for i in xrange(4 * 1024):
+                    yield null_mb
+            with open(path, 'wb') as fh:
+                for x in iter_deflate(iter_simple()):
+                    fh.write(x)
+
+        compressed = open(path, 'rb').read()
+        print len(compressed), 'compressed.'
+
+        crc = 0
+        for i in xrange(4 * 1024):
+            crc = crc32(null_mb, crc) & 0xffffffff
+
+        mem = zipper.add_from_func(lambda: compressed, len(compressed), 'null.txt',
+            crc=crc,
+            compress_type=COMPRESSION_DEFLATE,
+            file_size=2**32,
+        )
+        
+
+    if args.corrupt_macs:
+        for m in zipper.infos:
+            m.crc = 0xbaaaaaad
+
+    if args.force_data_descriptor:
+        for m in zipper.infos:
+            m.use_data_descriptor = True
+
+    print zipper.calculate_size(unify_zip64=args.unify_zip64)
 
     fh = open(args.output, 'wb') if args.output else None
 
     size = 0
-    for chunk in zipseer.iter():
+    for chunk in zipper.iter():
         size += len(chunk)
         if fh:
             fh.write(chunk)
