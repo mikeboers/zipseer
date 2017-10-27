@@ -67,7 +67,7 @@ def iter_deflate(source):
     yield compressor.flush()
 
 
-class ZipInfo (object):
+class ZipInfo(object):
     """Class with attributes describing each file in the ZIP archive."""
 
     __slots__ = (
@@ -93,8 +93,7 @@ class ZipInfo (object):
             'source_func',
         )
 
-    def __init__(self, filename, date_time=(1980, 1, 1, 0, 0, 0),
-        file_size=None, compress_type=None, compress_size=None, crc=None):
+    def __init__(self, filename, date_time=(1980, 1, 1, 0, 0, 0), **kwargs):
 
         # Terminate the file name at the first null byte.  Null bytes in file
         # names are used as tricks by viruses in archives.
@@ -113,11 +112,8 @@ class ZipInfo (object):
         if date_time[0] < 1980:
             raise ValueError("ZIP does not support timestamps before 1980.", date_time)
 
-        if compress_type is None:
-            compress_type = COMPRESSION_NONE
-
         # Standard values:
-        self.compress_type = compress_type # Type of compression for the file
+        self.compress_type = COMPRESSION_NONE # Type of compression for the file
         self.comment = ""               # Comment for each file
         self.extra = ""                 # ZIP extra data
         if sys.platform == 'win32':
@@ -140,9 +136,12 @@ class ZipInfo (object):
         # Mutable state, mostly set by ZipFile
         self.use_zip64 = False             # Are we using zip64 for sure?
         self.header_offset = None          # Byte offset to the file header
-        self.crc = crc                     # CRC-32 of the uncompressed file
-        self.compress_size = compress_size # Size of the compressed file
-        self.file_size = file_size         # Size of the uncompressed file
+        self.crc = None                     # CRC-32 of the uncompressed file
+        self.compress_size = None # Size of the compressed file
+        self.file_size = None         # Size of the uncompressed file
+
+        for k, v in kwargs.iteritems():
+            setattr(self, k, v)
 
     @classmethod
     def from_path(cls, filename, arcname=None, **kwargs):
