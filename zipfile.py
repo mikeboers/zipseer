@@ -468,9 +468,13 @@ class ZipFile(object):
         centDirOffset = pos1
         
         if (
-            centDirCount > ZIP_FILECOUNT_LIMIT or
-            centDirOffset > ZIP64_LIMIT or
-            centDirSize > ZIP64_LIMIT
+            # The spec requires ZIP64 if any of these are >, but we're testing
+            # against >= to avoid an edge case in which one of them is > and
+            # one is ==. So instead of being wrong in that case, we're ZIP64
+            # if everything is ==.
+            centDirCount >= ZIP_FILECOUNT_LIMIT or
+            centDirOffset >= ZIP64_LIMIT or
+            centDirSize >= ZIP64_LIMIT
         ):
             # Write the ZIP64 end-of-archive records
             zip64endrec = struct.pack(
@@ -484,9 +488,9 @@ class ZipFile(object):
                     stringEndArchive64Locator, 0, pos2, 1)
             yield zip64locrec
 
-            centDirCount  = min(centDirCount, 0xFFFF)
-            centDirSize   = min(centDirSize, 0xFFFFFFFF)
-            centDirOffset = min(centDirOffset, 0xFFFFFFFF)
+            centDirCount  = 0xFFFF
+            centDirSize   = 0xFFFFFFFF
+            centDirOffset = 0xFFFFFFFF
 
         endrec = struct.pack(structEndArchive, stringEndArchive,
                             0, 0, centDirCount, centDirCount,
